@@ -1,0 +1,77 @@
+name: Build for Botkeep
+
+on:
+  # 支持在 Actions 页面手动点击运行
+  workflow_dispatch:
+  # 当 main 分支有更新（比如你 Sync fork 同步上游更新）时自动触发
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 检出源码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Node.js 22 并编译 Web 前端
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: 3. 执行前端构建并生成 web_dist
+        run: |
+          export NEXT_PUBLIC_APP_VERSION="$(cat VERSION | tr -d '\r\n')"
+          cd web
+          npm install
+          npm run build
+          cd ..
+          rm -rf web_dist
+          mv web/out ./web_dist
+
+      - name: 4. 安装 uv 并导出标准 requirements.txt
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: 5. 导出 Python 依赖并清理构建垃圾
+        run: |
+          uv export --format requirements-txt --no-hashes --no-dev > requirements.txt
+          # 删除庞大的前端源码和 node_modules，大幅减小 Botkeep 拉取体积
+          rm -rf web .github/workflows/docker-publish.yml
+
+      - name: 6. 生成供手动上传备用的 ZIP 包 (Artifacts)
+        run: |
+          zip -r botkeep-ready.zip \
+            main.py config.json VERSION CHANGELOG.md pyproject.toml uv.lock requirements.txt \
+            api services utils scripts web_dist
+
+      - name: 7. 上传 ZIP 产物到 Actions 页面（可选下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt2api-botkeep-zip
+          path: botkeep-ready.zip
+          retention-days: 7
+
+      - name: 8. 强制推送到 botkeep-deploy 分支
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 确保 web_dist 和 requirements.txt 不被 .gitignore 拦截
+          sed -i '/web_dist/d' .gitignore || true
+          sed -i '/requirements.txt/d' .gitignore || true
+          
+          git checkout --orphan temp-deploy-branch
+          git rm -rf --cached .
+          git add main.py config.json VERSION CHANGELOG.md pyproject.toml uv.lock requirements.txt
+          git add api services utils scripts web_dist
+          git commit -m "chore: prebuild web_dist & requirements.txt for Botkeep ($(date +'%Y-%m-%d %H:%M'))"
+          git branch -M botkeep-deploy
+          git push -f origin botkeep-deploy
