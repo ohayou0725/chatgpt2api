@@ -1,4 +1,3 @@
-import hashlib
 import json
 import random
 import re
@@ -165,21 +164,60 @@ def build_pow_config(
     ]
 
 
-def _pow_generate(seed: str, difficulty: str, config: list[Any], limit: int = 500000) -> tuple[str, bool]:
-    target = bytes.fromhex(difficulty)
-    diff_len = len(difficulty) // 2
-    seed_bytes = seed.encode()
-    static_1 = (json.dumps(config[:3], separators=(",", ":"), ensure_ascii=False)[:-1] + ",").encode()
-    static_2 = ("," + json.dumps(config[4:9], separators=(",", ":"), ensure_ascii=False)[1:-1] + ",").encode()
-    static_3 = ("," + json.dumps(config[10:], separators=(",", ":"), ensure_ascii=False)[1:]).encode()
-    for i in range(limit):
-        final_json = static_1 + str(i).encode() + static_2 + str(i >> 1).encode() + static_3
-        encoded = pybase64.b64encode(final_json)
-        digest = hashlib.sha3_512(seed_bytes + encoded).digest()
-        if digest[:diff_len] <= target:
-            return encoded.decode(), True
-    fallback = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + pybase64.b64encode(f'"{seed}"'.encode()).decode()
-    return fallback, False
+POW_REQUIREMENTS_SEED = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
+POW_ANSWER_SUFFIX = "~S"
+POW_MAX_ATTEMPTS = 500000
+_FNV_OFFSET_BASIS = 2166136261
+_FNV_PRIME = 16777619
+
+
+def _fnv1a_avalanche(value: str) -> str:
+    """sentinel SDK（2026-10-14 版）的 PoW 摘要：FNV-1a 32 位 + murmur3 fmix32 终混。
+
+    对应 sdk.js 里 `let e=2166136261; for(...) e^=t.charCodeAt(r), e=Math.imul(e,16777619)>>>0;`
+    之后的三步终混；charCodeAt 是 UTF-16 码元语义，因此按 utf-16-le 逐码元迭代。
+    """
+    digest = _FNV_OFFSET_BASIS
+    units = value.encode("utf-16-le")
+    for index in range(0, len(units), 2):
+        digest ^= units[index] | (units[index + 1] << 8)
+        digest = (digest * _FNV_PRIME) & 0xFFFFFFFF
+    digest ^= digest >> 16
+    digest = (digest * 2246822507) & 0xFFFFFFFF
+    digest ^= digest >> 13
+    digest = (digest * 3266489909) & 0xFFFFFFFF
+    digest ^= digest >> 16
+    return f"{digest:08x}"
+
+
+def _encode_pow_config(config: list[Any]) -> str:
+    # 对应 sdk.js 的 N()：btoa(TextEncoder(JSON.stringify(config)))
+    return pybase64.b64encode(
+        json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).decode()
+
+
+def _solve_pow_answer(
+    seed: str,
+    difficulty: str,
+    config: list[Any],
+    limit: int = POW_MAX_ATTEMPTS,
+) -> str | None:
+    """按 sdk.js 的 _generateAnswerAsync/_runCheck 逐次尝试。
+
+    每次把 [3] 置为尝试序号、[9] 置为求解耗时（毫秒），
+    摘要前缀 `<= difficulty`（与 JS 相同的字符串比较）时返回 base64 + "~S"。
+    """
+    working = list(config)
+    difficulty_length = len(difficulty)
+    started = time.perf_counter()
+    for attempt in range(limit):
+        working[3] = attempt
+        working[9] = int((time.perf_counter() - started) * 1000 + 0.5)  # Math.round
+        encoded = _encode_pow_config(working)
+        if _fnv1a_avalanche(seed + encoded)[:difficulty_length] <= difficulty:
+            return encoded + POW_ANSWER_SUFFIX
+    return None
 
 
 def build_legacy_requirements_token(
@@ -187,10 +225,16 @@ def build_legacy_requirements_token(
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
 ) -> str:
+    """名字沿用上游；内容为当前 SDK 的 getRequirementsToken 格式。
+
+    即 "gAAAAAC" + _generateAnswerAsync("wQ8Lk5...", "0") = base64(config) + "~S"。
+    求解失败（理论不可达，期望 ~16 次内命中）时退回旧 blocking 格式（纯 base64）。
+    """
     config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
-    return "gAAAAAC" + pybase64.b64encode(
-        json.dumps(config, separators=(",", ":"), ensure_ascii=False).encode()
-    ).decode()
+    answer = _solve_pow_answer(POW_REQUIREMENTS_SEED, "0", config)
+    if answer is None:
+        answer = _encode_pow_config(config)
+    return "gAAAAAC" + answer
 
 
 def build_proof_token(
@@ -201,7 +245,7 @@ def build_proof_token(
     data_build: str = "",
 ) -> str:
     config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
-    answer, solved = _pow_generate(seed, difficulty, config)
-    if not solved:
+    answer = _solve_pow_answer(seed, difficulty, config)
+    if answer is None:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")
     return "gAAAAAB" + answer

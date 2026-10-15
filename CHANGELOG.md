@@ -2,6 +2,10 @@
 
 ## Unreleased
 
++ [修复] sentinel PoW 按官方 sdk.js（20260219f9f6）逐字对齐：摘要从 SHA3-512 改为 FNV-1a 32 位 + murmur3 fmix32 终混（8 位小写 hex，按 UTF-16 码元迭代），比较改为 `digest[:len(difficulty)] <= difficulty`，答案统一追加 `~S` 后缀；每次尝试更新配置的 `[3]`（尝试序号）与 `[9]`（求解耗时毫秒）。requirements token 同步改为对固定种子 `wQ8Lk5…` 求解 difficulty `"0"` 的异步格式，求解失败时回落到旧的纯配置 base64 格式。
++ [修复] 经求解服务转发的请求补齐浏览器真实 Client Hints（`sec-ch-ua` 系列）：`context.request` 不会自动附带这些头，此前所有转发请求都缺失，属于明显的非浏览器指纹。
++ [新增] 求解服务新增 `/v1/sdk` 诊断端点：在页面内注入官方 sdk.js，可携带账号 Authorization（桥接到 SDK 的隐藏 iframe），用于对照官方 token 生成。
+
 ## 1.8.2 - 2026-10-15
 
 + [修复] Cloudflare 对主服务出口的非浏览器客户端（curl_cffi 各版本指纹）在敏感路由（首页、sentinel prepare、conversation init、f/conversation 等）统一下发托管挑战（403 + `cf-mitigated: challenge`）后，chatgpt.com 请求改由 sentinel 求解服务的浏览器上下文代发（新增 `/v1/relay`），浏览器自动补齐 UA / Client Hints / cookie；浏览器自身吃到挑战时自动重开页面重试。

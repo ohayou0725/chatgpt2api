@@ -39,6 +39,30 @@ BASE_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = window.chrome || { runtime: {} };
 """
+# SDK 内部用隐藏 iframe 发 sentinel prepare 请求；当 localStorage 里有桥接 token 时，
+# 给 iframe 里发往 /sentinel/ 的 fetch 补上账号 Authorization，让下发的 token 与账号同域。
+AUTH_BRIDGE_SCRIPT = """
+(function () {
+  try {
+    if (window.top === window.self) return;
+    const token = localStorage.getItem('__sentinel_auth');
+    if (!token) return;
+    const original = window.fetch;
+    window.fetch = function (input, init) {
+      try {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        if (url.includes('/sentinel/')) {
+          init = init || {};
+          const headers = new Headers(init.headers || undefined);
+          if (!headers.has('authorization')) headers.set('authorization', token);
+          init = Object.assign({}, init, { headers: headers });
+        }
+      } catch (error) {}
+      return original.call(this, input, init);
+    };
+  } catch (error) {}
+})();
+"""
 
 SOLVER_KEY = os.getenv("SENTINEL_SOLVER_KEY", "").strip()
 PROXY = os.getenv("SENTINEL_SOLVER_PROXY", "").strip()
@@ -76,6 +100,7 @@ class SolverPage:
         self._lock = asyncio.Lock()
         self.user_agent = USER_AGENT
         self.last_error = ""
+        self._client_hints: dict[str, str] | None = None
 
     async def start(self) -> None:
         self._playwright = await async_playwright().start()
@@ -128,6 +153,7 @@ class SolverPage:
             except Exception:
                 pass
         self._page = None
+        self._client_hints = None
         context_kwargs = {
             "locale": "zh-CN",
             "viewport": {"width": 1280, "height": 800},
@@ -137,6 +163,7 @@ class SolverPage:
             context_kwargs["timezone_id"] = TIMEZONE
         context = await self._browser.new_context(**context_kwargs)
         await context.add_init_script(BASE_INIT_SCRIPT)
+        await context.add_init_script(AUTH_BRIDGE_SCRIPT)
         await context.add_init_script(VM_SCRIPT)
         await Stealth().apply_stealth_async(context)
         page = await context.new_page()
@@ -165,6 +192,13 @@ class SolverPage:
             return await page.evaluate("location.hostname === 'chatgpt.com' && typeof window.__sentinelVM === 'object'")
         except Exception:
             return False
+
+    async def client_hints(self) -> dict[str, str]:
+        """页面真实的 Client Hints（sec-ch-ua 系列），转发时补齐。"""
+        if self._client_hints is None:
+            page = await self.page()
+            self._client_hints = await _page_client_hints(page)
+        return self._client_hints
 
     async def evaluate(self, expression: str, arg: object) -> object:
         """在页面里执行；页面失效时重开一次再试。"""
@@ -214,6 +248,11 @@ class SORequest(BaseModel):
     p: str
 
 
+class SDKRequest(BaseModel):
+    flow: str = "chat-requirements"
+    authorization: str = ""
+
+
 class RelayRequest(BaseModel):
     method: str = "GET"
     url: str
@@ -255,6 +294,32 @@ async def _relay_fetch(page: Page, method: str, url: str, headers: dict[str, str
     if payload is not None:
         kwargs["data"] = payload
     return await page.context.request.fetch(url, **kwargs)
+
+
+async def _page_client_hints(page: Page) -> dict[str, str]:
+    """从页面读真实 Client Hints；context.request 不会自动附 sec-ch-ua，需要显式补齐。"""
+    hints = await page.evaluate(
+        """async () => {
+            const data = navigator.userAgentData;
+            if (!data) return {};
+            const high = await data.getHighEntropyValues(
+                ["architecture", "bitness", "fullVersionList", "model", "platformVersion", "uaFullVersion"]
+            ).catch(() => ({}));
+            const join = (items) => (items || []).map((b) => `"${b.brand}";v="${b.version}"`).join(", ");
+            return {
+                "sec-ch-ua": join(data.brands),
+                "sec-ch-ua-mobile": data.mobile ? "?1" : "?0",
+                "sec-ch-ua-platform": `"${data.platform}"`,
+                "sec-ch-ua-platform-version": `"${high.platformVersion || ""}"`,
+                "sec-ch-ua-arch": `"${high.architecture || ""}"`,
+                "sec-ch-ua-bitness": `"${high.bitness || ""}"`,
+                "sec-ch-ua-model": `"${high.model || ""}"`,
+                "sec-ch-ua-full-version": `"${high.uaFullVersion || ""}"`,
+                "sec-ch-ua-full-version-list": join(high.fullVersionList),
+            };
+        }"""
+    )
+    return {str(name): str(value) for name, value in (hints or {}).items() if value}
 
 
 @app.get("/health")
@@ -317,6 +382,61 @@ async def solve_so(body: SORequest, authorization: str | None = Header(default=N
     return {"token": str(token or "")}
 
 
+@app.post("/v1/sdk")
+async def sdk_token(body: SDKRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    """诊断：页面里注入官方 sdk.js 并调用 SentinelSDK.token()，返回官方生成的 p/t/c。"""
+    require_key(authorization)
+    expression = """async ([flow]) => {
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const out = {
+            sentinel_sdk: null, token_is_stub: null, sentinel_vm: typeof window.__sentinelVM,
+            loads: [], pending_tokens: null, prepare_json: null, raw: null, error: null
+        };
+        try {
+            if (typeof window.SentinelSDK === 'undefined') {
+                await new Promise((resolve) => {
+                    const script = document.createElement('script');
+                    script.src = '/backend-api/sentinel/sdk.js';
+                    script.async = true;
+                    script.onload = resolve;
+                    script.onerror = resolve;
+                    document.head.appendChild(script);
+                });
+                for (let i = 0; i < 60; i++) {
+                    const attempts = ((window.__sentinel_script_loads || {}).attempts || []);
+                    if (attempts.length && attempts[attempts.length - 1].state === 'loaded') break;
+                    await sleep(500);
+                }
+            }
+            out.sentinel_sdk = typeof window.SentinelSDK;
+            out.loads = ((window.__sentinel_script_loads || {}).attempts || []).map(a => a.state);
+            out.pending_tokens = ((window.__sentinel_token_pending) || []).length;
+            if (typeof window.SentinelSDK !== 'object' || !window.SentinelSDK) throw new Error('SentinelSDK unavailable');
+            out.token_is_stub = String(window.SentinelSDK.token).includes('__sentinel_token_pending');
+            if (out.token_is_stub) throw new Error('SentinelSDK is still the bootstrap stub');
+            const raw = await Promise.race([
+                window.SentinelSDK.token(flow),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('sdk token timeout (90s)')), 90000))
+            ]);
+            out.raw = typeof raw === 'string' ? raw : JSON.stringify(raw);
+        } catch (err) { out.error = String((err && err.message) || err); }
+        return out;
+    }"""
+    if body.authorization:
+        await solver.evaluate("(t) => localStorage.setItem('__sentinel_auth', t)", body.authorization)
+    try:
+        result = await solver.evaluate(expression, [body.flow])
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"sdk token failed: {exc}") from exc
+    finally:
+        if body.authorization:
+            try:
+                await solver.evaluate("() => localStorage.removeItem('__sentinel_auth')", None)
+            except Exception:
+                pass
+    return result if isinstance(result, dict) else {"raw": str(result)}
+
+
 @app.post("/v1/relay")
 async def relay(body: RelayRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
     """用浏览器上下文代发一个 HTTP 请求（主服务唯一能通过 Cloudflare 的出口）。
@@ -334,6 +454,11 @@ async def relay(body: RelayRequest, authorization: str | None = Header(default=N
     timeout_ms = max(RELAY_TIMEOUT_MIN_MS, min(int(body.timeout_ms or 300000), RELAY_TIMEOUT_MAX_MS))
     try:
         page = await solver.page()
+        hints = await solver.client_hints()
+        lowered = {name.lower() for name in headers}
+        for name, value in hints.items():
+            if name not in lowered:
+                headers[name] = value
         response = await _relay_fetch(page, method, body.url, headers, payload, timeout_ms)
         if response.status == 403 and str((response.headers or {}).get("cf-mitigated") or "") == "challenge":
             await solver.invalidate()
