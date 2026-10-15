@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [修复] sentinel requirements/proof token 的浏览器字段改为取自求解页面的真实环境（时区与日期串、语言、核数、堆上限、屏幕分辨率）：求解服务 `/health` 新增 `environment` 字段，主服务按它生成 25 字段指纹，替代此前写死的美东时区、`en-US` 语言与用开机时长冒充的页面停留时间。字段与真实页面不一致（即使 Turnstile 是真的）仍会被判低质量并伪装成 404 "Model not found"，实测多个字段需同时匹配。
++ [修复] 获取账号信息前先预热首页拿到 Cloudflare cookie，避免冷会话直接请求 `conversation/init`、`accounts/check` 时被 403 挑战页拦截导致账号刷新与生图预检失败。
 + [修复] sentinel PoW 按官方 sdk.js（20260219f9f6）逐字对齐：摘要从 SHA3-512 改为 FNV-1a 32 位 + murmur3 fmix32 终混（8 位小写 hex，按 UTF-16 码元迭代），比较改为 `digest[:len(difficulty)] <= difficulty`，答案统一追加 `~S` 后缀；每次尝试更新配置的 `[3]`（尝试序号）与 `[9]`（求解耗时毫秒）。requirements token 同步改为对固定种子 `wQ8Lk5…` 求解 difficulty `"0"` 的异步格式，求解失败时回落到旧的纯配置 base64 格式。
 + [修复] 经求解服务转发的请求补齐浏览器真实 Client Hints（`sec-ch-ua` 系列）：`context.request` 不会自动附带这些头，此前所有转发请求都缺失，属于明显的非浏览器指纹。
 + [新增] 求解服务新增 `/v1/sdk` 诊断端点：在页面内注入官方 sdk.js，可携带账号 Authorization（桥接到 SDK 的隐藏 iframe），用于对照官方 token 生成。

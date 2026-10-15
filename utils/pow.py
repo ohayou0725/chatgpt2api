@@ -48,16 +48,36 @@ def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     return script_sources, data_build
 
 
-def _legacy_parse_time() -> str:
-    now = datetime.now(timezone(timedelta(hours=-5)))
-    return now.strftime("%a %b %d %Y %H:%M:%S") + " GMT-0500 (Eastern Standard Time)"
+# 网页版 requirements/proof token 的固定字段（Linux Chrome 153 实测值；无求解页面环境时兜底）
+DEFAULT_HEAP_LIMIT = 4395630592
+DEFAULT_LANGUAGE = "zh-CN"
+DEFAULT_LANGUAGES = "en-US,en"
+
+
+def _browser_date(environment: dict[str, Any]) -> str:
+    """复刻浏览器 `new Date().toString()`；有求解页面环境时用它的时区，否则用本机时区。"""
+    suffix = str(environment.get("date_suffix") or "")
+    offset = environment.get("utc_offset_minutes")
+    if suffix and isinstance(offset, (int, float)):
+        now = datetime.now(timezone(timedelta(minutes=int(offset))))
+    else:
+        now = datetime.now().astimezone()
+        suffix = f"GMT{now.strftime('%z')} ({now.tzname()})"
+    return now.strftime("%a %b %d %Y %H:%M:%S") + " " + suffix
 
 
 def build_pow_config(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    environment: dict[str, Any] | None = None,
 ) -> list[Any]:
+    """按网页 sentinel SDK 的 25 字段格式生成浏览器指纹。
+
+    时区、语言、核数等优先取求解页面的真实值（见 sentinel_solver /health 的 environment），
+    与算 Turnstile 的页面保持一致；旧版写死美东时区、en-US 等值的组合会被判为低质量请求。
+    """
+    environment = environment or {}
     navigator_key = random.choice([
         "registerProtocolHandler−function registerProtocolHandler() { [native code] }",
         "storage−[object StorageManager]",
@@ -140,25 +160,27 @@ def build_pow_config(
         "__NEXT_PRELOADREADY",
     ])
     script_source = random.choice(list(script_sources)) if script_sources else DEFAULT_POW_SCRIPT
+    # 页面打开以来的毫秒数；旧版用 time.perf_counter()，在 Linux 上是开机时长，明显不像真实页面
+    page_age_ms = random.uniform(2000, 30000)
     return [
-        sum(random.choices(SCREEN_RESOLUTIONS, k=1)[0]),
-        _legacy_parse_time(),
-        4294705152,
+        int(environment.get("screen_sum") or sum(random.choice(SCREEN_RESOLUTIONS))),
+        _browser_date(environment),
+        int(environment.get("heap_limit") or DEFAULT_HEAP_LIMIT),
         1,
         user_agent,
         script_source,
         data_build,
-        "en-US",
-        "en-US,es-US,en,es",
+        str(environment.get("language") or DEFAULT_LANGUAGE),
+        str(environment.get("languages") or DEFAULT_LANGUAGES),
         random.random(),
         navigator_key,
         random.choice(DOCUMENT_KEYS),
         window_key,
-        time.perf_counter() * 1000,
+        page_age_ms,
         new_uuid(),
         "",
-        random.choice(CORES),
-        time.time() * 1000 - (time.perf_counter() * 1000),
+        int(environment.get("hardware_concurrency") or random.choice(CORES)),
+        time.time() * 1000 - page_age_ms,
         0, 0, 0, 0, 0, 0,
         0,  # 0 = edge/chrome, 1 = firefox
     ]
@@ -224,13 +246,14 @@ def build_legacy_requirements_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    environment: dict[str, Any] | None = None,
 ) -> str:
     """名字沿用上游；内容为当前 SDK 的 getRequirementsToken 格式。
 
     即 "gAAAAAC" + _generateAnswerAsync("wQ8Lk5...", "0") = base64(config) + "~S"。
     求解失败（理论不可达，期望 ~16 次内命中）时退回旧 blocking 格式（纯 base64）。
     """
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, environment=environment)
     answer = _solve_pow_answer(POW_REQUIREMENTS_SEED, "0", config)
     if answer is None:
         answer = _encode_pow_config(config)
@@ -243,8 +266,9 @@ def build_proof_token(
     user_agent: str,
     script_sources: Sequence[str] | None = None,
     data_build: str = "",
+    environment: dict[str, Any] | None = None,
 ) -> str:
-    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build)
+    config = build_pow_config(user_agent, script_sources=script_sources, data_build=data_build, environment=environment)
     answer = _solve_pow_answer(seed, difficulty, config)
     if answer is None:
         raise RuntimeError(f"failed to solve proof token: difficulty={difficulty}")

@@ -24,6 +24,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from urllib.parse import urlparse
 
 import uvicorn
@@ -80,12 +81,31 @@ DROP_REQUEST_HEADERS = {
     "sec-ch-ua-full-version-list", "sec-ch-ua-mobile", "sec-ch-ua-model",
     "sec-ch-ua-platform", "sec-ch-ua-platform-version",
 }
+# 主服务据此生成 requirements/proof token 里的浏览器字段，使其与算 Turnstile 的页面一致
+ENVIRONMENT_SCRIPT = """() => ({
+    screen_sum: screen.width + screen.height,
+    date_suffix: new Date().toString().replace(/^.*? (GMT[+-]\\d{4})/, '$1'),
+    utc_offset_minutes: -new Date().getTimezoneOffset(),
+    heap_limit: (performance.memory && performance.memory.jsHeapSizeLimit) || null,
+    language: navigator.language,
+    languages: (navigator.languages || []).join(','),
+    hardware_concurrency: navigator.hardwareConcurrency,
+})"""
 # 转发时丢弃的响应头：由浏览器解码处理过，回传会造成双重解码
 DROP_RESPONSE_HEADERS = {
     "content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie", "set-cookie2",
 }
 RELAY_TIMEOUT_MIN_MS = 5000
 RELAY_TIMEOUT_MAX_MS = 900000
+
+
+def playwright_proxy(url: str) -> dict[str, str]:
+    """Chromium 不认 URL 里的账号密码，需拆成 Playwright 的 username/password 字段。"""
+    parts = urlsplit(url)
+    if not parts.username:
+        return {"server": url}
+    server = f"{parts.scheme}://{parts.hostname}" + (f":{parts.port}" if parts.port else "")
+    return {"server": server, "username": unquote(parts.username), "password": unquote(parts.password or "")}
 
 
 class SolverPage:
@@ -99,6 +119,7 @@ class SolverPage:
         self._opened_at = 0.0
         self._lock = asyncio.Lock()
         self.user_agent = USER_AGENT
+        self.environment: dict[str, object] = {}
         self.last_error = ""
         self._client_hints: dict[str, str] | None = None
 
@@ -111,7 +132,7 @@ class SolverPage:
             "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         }
         if PROXY:
-            launch_kwargs["proxy"] = {"server": PROXY}
+            launch_kwargs["proxy"] = playwright_proxy(PROXY)
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         if not self.user_agent:
             major = self._browser.version.split(".")[0]
@@ -175,6 +196,7 @@ class SolverPage:
                 await context.close()
                 raise RuntimeError(f"chatgpt.com page not ready (title={title!r}), likely stuck on a Cloudflare challenge")
             await asyncio.sleep(1)
+        self.environment = await page.evaluate(ENVIRONMENT_SCRIPT)
         self._context = context
         self._page = page
         self._opened_at = time.monotonic()
@@ -220,6 +242,7 @@ class SolverPage:
             "browser_version": self._browser.version if self._browser else None,
             "user_agent": self.user_agent,
             "timezone": TIMEZONE or None,
+            "environment": self.environment,
             "last_error": self.last_error or None,
         }
 

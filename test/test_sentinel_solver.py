@@ -32,7 +32,7 @@ def solver_config(url: str = "http://solver:8080", key: str = "solver-key"):
 
 class SentinelSolverClientTests(unittest.TestCase):
     def setUp(self) -> None:
-        client_module._user_agent_cache.update(url="", value="", expires_at=0.0)
+        client_module._user_agent_cache.update(url="", value={}, expires_at=0.0)
 
     def test_solve_turnstile_calls_solver_with_key(self) -> None:
         with solver_config(), mock.patch.object(
@@ -70,6 +70,18 @@ class SentinelSolverClientTests(unittest.TestCase):
     def test_solver_user_agent_empty_without_solver(self) -> None:
         with solver_config(url=""), mock.patch.object(client_module.requests, "get") as get:
             self.assertEqual(client_module.solver_user_agent(), "")
+        get.assert_not_called()
+
+    def test_solver_environment_shares_health_cache(self) -> None:
+        health = {"user_agent": "SolverUA/1.0", "environment": {"language": "zh-CN", "hardware_concurrency": 28}}
+        with solver_config(), mock.patch.object(client_module.requests, "get", return_value=FakeResponse(200, health)) as get:
+            self.assertEqual(client_module.solver_environment(), {"language": "zh-CN", "hardware_concurrency": 28})
+            self.assertEqual(client_module.solver_user_agent(), "SolverUA/1.0")
+        get.assert_called_once()
+
+    def test_solver_environment_empty_without_solver(self) -> None:
+        with solver_config(url=""), mock.patch.object(client_module.requests, "get") as get:
+            self.assertEqual(client_module.solver_environment(), {})
         get.assert_not_called()
 
 

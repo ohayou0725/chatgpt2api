@@ -19,7 +19,7 @@ SOLVER_TIMEOUT_SECONDS = 20
 USER_AGENT_CACHE_SECONDS = 600
 
 _user_agent_lock = threading.Lock()
-_user_agent_cache: dict[str, object] = {"url": "", "value": "", "expires_at": 0.0}
+_user_agent_cache: dict[str, object] = {"url": "", "value": {}, "expires_at": 0.0}
 
 
 def _solver_headers() -> dict[str, str]:
@@ -29,29 +29,42 @@ def _solver_headers() -> dict[str, str]:
     return headers
 
 
+def _solver_profile() -> dict:
+    """求解服务 /health 的结果（页面 UA 与浏览器环境）；未配置或获取失败时返回空 dict。"""
+    base_url = config.sentinel_solver_url
+    if not base_url:
+        return {}
+    with _user_agent_lock:
+        now = time.monotonic()
+        if _user_agent_cache["url"] == base_url and now < float(_user_agent_cache["expires_at"]):
+            return dict(_user_agent_cache["value"])
+        value: dict = {}
+        try:
+            response = requests.get(f"{base_url}/health", headers=_solver_headers(), timeout=SOLVER_TIMEOUT_SECONDS)
+            if response.status_code == 200:
+                payload = response.json() or {}
+                if payload.get("user_agent"):
+                    value = payload
+        except Exception as exc:
+            logger.warning({"event": "sentinel_solver_health_error", "error": str(exc)})
+        # 失败时短暂缓存空值，避免每个请求都去探测一个挂掉的求解服务
+        _user_agent_cache.update(url=base_url, value=value, expires_at=now + (USER_AGENT_CACHE_SECONDS if value else 30))
+        return dict(value)
+
+
 def solver_user_agent() -> str:
     """求解页面使用的 UA；未配置求解服务或获取失败时返回空串。
 
     requirements/proof token 里编码的 UA 必须与算 Turnstile 的页面一致，
     否则对话接口返回伪装成 404 的 "Model not found"。
     """
-    base_url = config.sentinel_solver_url
-    if not base_url:
-        return ""
-    with _user_agent_lock:
-        now = time.monotonic()
-        if _user_agent_cache["url"] == base_url and now < float(_user_agent_cache["expires_at"]):
-            return str(_user_agent_cache["value"])
-        value = ""
-        try:
-            response = requests.get(f"{base_url}/health", headers=_solver_headers(), timeout=SOLVER_TIMEOUT_SECONDS)
-            if response.status_code == 200:
-                value = str((response.json() or {}).get("user_agent") or "")
-        except Exception as exc:
-            logger.warning({"event": "sentinel_solver_health_error", "error": str(exc)})
-        # 失败时短暂缓存空值，避免每个请求都去探测一个挂掉的求解服务
-        _user_agent_cache.update(url=base_url, value=value, expires_at=now + (USER_AGENT_CACHE_SECONDS if value else 30))
-        return value
+    return str(_solver_profile().get("user_agent") or "")
+
+
+def solver_environment() -> dict:
+    """求解页面的时区、语言、核数等浏览器环境，用于生成 requirements/proof token；拿不到时返回空 dict。"""
+    environment = _solver_profile().get("environment")
+    return dict(environment) if isinstance(environment, dict) else {}
 
 
 def solve_turnstile(dx: str, p: str) -> str:

@@ -23,7 +23,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from services.sentinel_solver_client import solve_turnstile, solver_user_agent
+from services.sentinel_solver_client import solve_turnstile, solver_environment, solver_user_agent
 from services.solver_relay_session import RelaySession
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -344,6 +344,11 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
+        # 先预热首页拿到 Cloudflare cookie；冷会话直接请求 conversation/init 等接口常被 403 挑战页拦截
+        try:
+            self._bootstrap()
+        except Exception as exc:
+            logger.warning({"event": "backend_user_info_bootstrap_failed", "error": str(exc)})
         executor = ThreadPoolExecutor(max_workers=3)
         try:
             me_future = executor.submit(self._get_me)
@@ -420,6 +425,7 @@ class OpenAIBackendAPI:
                 self._sentinel_user_agent(),
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                environment=solver_environment(),
             )
 
         turnstile_token = ""
@@ -2684,7 +2690,10 @@ class OpenAIBackendAPI:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
         sentinel_user_agent = self._sentinel_user_agent()
-        p_token = build_legacy_requirements_token(sentinel_user_agent, self.pow_script_sources, self.pow_data_build)
+        sentinel_environment = solver_environment()
+        p_token = build_legacy_requirements_token(
+            sentinel_user_agent, self.pow_script_sources, self.pow_data_build, environment=sentinel_environment
+        )
 
         prepare_path = base + "/prepare"
         response = self.session.post(
@@ -2708,6 +2717,7 @@ class OpenAIBackendAPI:
                 sentinel_user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                environment=sentinel_environment,
             )
 
         turnstile_token = ""
