@@ -445,6 +445,27 @@ async def sdk_token(body: SDKRequest, authorization: str | None = Header(default
         } catch (err) { out.error = String((err && err.message) || err); }
         return out;
     }"""
+    trace: list[dict[str, object]] = []
+
+    def _record(request: object) -> None:
+        # 诊断用：记录 SDK 握手期间的网络请求（含隐藏 iframe 里的）
+        try:
+            url = str(getattr(request, "url", ""))
+            if "sentinel" not in url and "conversation" not in url:
+                return
+            headers = {k.lower(): v for k, v in dict(getattr(request, "headers", {}) or {}).items()}
+            trace.append({
+                "method": str(getattr(request, "method", "")),
+                "url": url[:300],
+                "post_data": str(getattr(request, "post_data", "") or "")[:1500],
+                "device_id": headers.get("oai-device-id", ""),
+                "target_path": headers.get("x-openai-target-path", ""),
+            })
+        except Exception:
+            pass
+
+    page = await solver.page()
+    page.on("request", _record)
     if body.authorization:
         await solver.evaluate("(t) => localStorage.setItem('__sentinel_auth', t)", body.authorization)
     try:
@@ -452,12 +473,19 @@ async def sdk_token(body: SDKRequest, authorization: str | None = Header(default
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"sdk token failed: {exc}") from exc
     finally:
+        try:
+            page.remove_listener("request", _record)
+        except Exception:
+            pass
         if body.authorization:
             try:
                 await solver.evaluate("() => localStorage.removeItem('__sentinel_auth')", None)
             except Exception:
                 pass
-    return result if isinstance(result, dict) else {"raw": str(result)}
+    if not isinstance(result, dict):
+        result = {"raw": str(result)}
+    result["trace"] = trace[:40]
+    return result
 
 
 @app.post("/v1/relay")

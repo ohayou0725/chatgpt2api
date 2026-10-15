@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.3 - 2026-10-15
 
 + [修复] sentinel requirements/proof token 的浏览器字段改为取自求解页面的真实环境（时区与日期串、语言、核数、堆上限、屏幕分辨率）：求解服务 `/health` 新增 `environment` 字段，主服务按它生成 25 字段指纹，替代此前写死的美东时区、`en-US` 语言与用开机时长冒充的页面停留时间。字段与真实页面不一致（即使 Turnstile 是真的）仍会被判低质量并伪装成 404 "Model not found"，实测多个字段需同时匹配。
 + [修复] PoW 配置里的脚本地址改为还原后的绝对 URL（浏览器 DOM 的 `document.scripts[i].src` 语义），此前直接提交 HTML 里的相对路径与真实页面不一致。
