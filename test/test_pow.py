@@ -73,6 +73,31 @@ class SolveAnswerTests(unittest.TestCase):
         self.assertIsNone(_solve_pow_answer("seed", "00000000", self._config(), limit=5))
 
 
+class ParseResourcesTests(unittest.TestCase):
+    """HTML 里的 script src 要还原成 DOM 语义的绝对 URL。"""
+
+    def test_relative_sources_become_absolute(self) -> None:
+        html = (
+            '<html data-build="prod-abc">'
+            '<script src="/unauth-mweb/scripts/a.js"></script>'
+            '<script src="https://chatgpt.com/backend-api/sentinel/sdk.js"></script>'
+            '<script src="//cdn.example.com/b.js"></script>'
+            '<script src="c/xyz/_next.js"></script>'
+            "</html>"
+        )
+        sources, data_build = pow_module.parse_pow_resources(html)
+        self.assertEqual(sources[0], "https://chatgpt.com/unauth-mweb/scripts/a.js")
+        self.assertEqual(sources[1], "https://chatgpt.com/backend-api/sentinel/sdk.js")
+        self.assertEqual(sources[2], "https://cdn.example.com/b.js")
+        self.assertEqual(sources[3], "https://chatgpt.com/c/xyz/_next.js")
+        self.assertEqual(data_build, "c/xyz/_")  # 脚本里的 build 优先于 html 属性
+
+    def test_empty_html_falls_back_to_default_script(self) -> None:
+        sources, data_build = pow_module.parse_pow_resources("<html></html>")
+        self.assertEqual(sources, [pow_module.DEFAULT_POW_SCRIPT])
+        self.assertEqual(data_build, "")
+
+
 class EnvironmentConfigTests(unittest.TestCase):
     """求解页面环境（时区/语言/核数等）应驱动 25 字段指纹，而不是兜底值。"""
 

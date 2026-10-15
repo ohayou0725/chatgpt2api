@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from typing import Any, Sequence
+from urllib.parse import urljoin
 
 import pybase64
 
@@ -36,10 +37,23 @@ class ScriptSrcParser(HTMLParser):
             self.data_build = match.group(0)
 
 
+def _absolute_script(source: str) -> str:
+    """把 HTML 里的相对 script src 还原为绝对 URL。
+
+    网页 SDK 取的是 document.scripts[i].src（DOM 解析后永远是绝对地址），
+    直接提交 HTML 里的相对路径与真实页面不一致。
+    """
+    if source.startswith(("http://", "https://")):
+        return source
+    if source.startswith("//"):
+        return "https:" + source
+    return urljoin("https://chatgpt.com/", source)
+
+
 def parse_pow_resources(html_content: str) -> tuple[list[str], str]:
     parser = ScriptSrcParser()
     parser.feed(html_content)
-    script_sources = parser.script_sources or [DEFAULT_POW_SCRIPT]
+    script_sources = [_absolute_script(source) for source in parser.script_sources] or [DEFAULT_POW_SCRIPT]
     data_build = parser.data_build
     if not data_build:
         match = re.search(r'<html[^>]*data-build="([^"]*)"', html_content)
