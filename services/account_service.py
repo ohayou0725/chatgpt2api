@@ -26,6 +26,8 @@ class AccountService:
 
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
+    # 生图遇到上游伪装 404 "Model not found" 后，该账号的本地冷却时长
+    _IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECONDS = 10 * 60
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_SECONDS = 3 * 24 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
@@ -134,6 +136,10 @@ class AccountService:
             return False
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
+        # 本地冷却中的账号（如被上游伪装 404 拒绝）暂时不再被选中
+        cooldown_until = AccountService._parse_time(account.get("image_cooldown_until"))
+        if cooldown_until is not None and cooldown_until > datetime.now(timezone.utc):
+            return False
         return int(account.get("quota") or 0) > 0
 
     @classmethod
@@ -229,6 +235,7 @@ class AccountService:
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
+        normalized["image_cooldown_until"] = normalized.get("image_cooldown_until") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
@@ -1331,6 +1338,44 @@ class AccountService:
             self._save_accounts()
             return dict(account)
         return None
+
+    def mark_image_cooldown(
+            self,
+            access_token: str,
+            *,
+            event: str = "image_stream",
+            seconds: int = _IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECONDS,
+    ) -> str:
+        """给账号写入本地生图冷却，返回冷却截止时间（ISO8601）。
+
+        仅写 `image_cooldown_until` 这一个字段：不清额度、不改状态、不标记异常。
+        冷却期内 `_is_image_account_available` 会跳过该账号，避免反复选中。
+        """
+        if not access_token:
+            return ""
+        cooldown_until = (datetime.now(timezone.utc) + timedelta(seconds=max(0, int(seconds)))).isoformat()
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return cooldown_until
+            next_item = dict(current)
+            next_item["image_cooldown_until"] = cooldown_until
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[access_token] = account
+                self._save_accounts()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "图片冷却",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "email": account.get("email") or "",
+                        "cooldown_until": cooldown_until,
+                    },
+                )
+        return cooldown_until
 
     def fetch_remote_info(
         self,

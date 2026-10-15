@@ -17,6 +17,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -102,6 +103,19 @@ def is_connection_timeout_error(message: str) -> bool:
         or "read timed out" in text
         or "connect timeout" in text
     )
+
+
+def is_upstream_model_not_found_error(exc: BaseException) -> bool:
+    """检测上游把低质量 sentinel 请求伪装成的 404。
+
+    2026-10-14 起 chatgpt.com 对 sentinel 握手质量做严格校验：
+    请求质量不够时不返回 403，而是返回 HTTP 404 且 JSON body 的 detail
+    精确等于 "Model not found"。仅精确匹配这一种形态，其他 404 不套用。
+    """
+    if not isinstance(exc, UpstreamHTTPError) or exc.status_code != 404:
+        return False
+    body = exc.body
+    return isinstance(body, dict) and str(body.get("detail") or "").strip() == "Model not found"
 
 
 def image_stream_error_message(message: str) -> str:
@@ -1305,11 +1319,14 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 上游伪装 404 "Model not found" 最大换账号重试次数
+    MAX_MODEL_NOT_FOUND_RETRIES = 3
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    model_not_found_retry_count = 0
     account_email = ""
 
     while True:
@@ -1490,6 +1507,38 @@ def _generate_single_image(
                     continue
                 account_service.remove_invalid_token(token, "image_stream")
                 continue
+            # 上游把低质量 sentinel 请求伪装成 404 "Model not found"：
+            # 账号级限制，换账号重试并给失败账号加本地冷却
+            if not emitted_for_token and is_upstream_model_not_found_error(exc):
+                model_not_found_retry_count += 1
+                cooldown_until = account_service.mark_image_cooldown(token, event="image_stream")
+                if model_not_found_retry_count <= MAX_MODEL_NOT_FOUND_RETRIES:
+                    logger.warning({
+                        "event": "image_model_not_found_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": model_not_found_retry_count,
+                        "index": index,
+                        "cooldown_until": cooldown_until,
+                        "error": last_error[:200],
+                    })
+                    continue
+                logger.warning({
+                    "event": "image_model_not_found_exhausted_retries",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "retry_count": model_not_found_retry_count,
+                    "index": index,
+                    "cooldown_until": cooldown_until,
+                    "error": last_error[:200],
+                })
+                raise ImageGenerationError(
+                    "upstream rejected the image request (model not found), please try again later",
+                    status_code=502,
+                    error_type="server_error",
+                    code="upstream_model_not_found",
+                    account_email=account_email,
+                ) from exc
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
                 tls_retry_count += 1
