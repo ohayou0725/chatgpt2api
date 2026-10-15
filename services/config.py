@@ -553,6 +553,23 @@ class ConfigStore:
         ).strip().rstrip("/")
 
     @property
+    def sentinel_solver_url(self) -> str:
+        """sentinel 求解服务地址（sentinel_solver/），为空时退回本地 Turnstile 求解。"""
+        return str(
+            os.getenv("CHATGPT2API_SENTINEL_SOLVER_URL")
+            or self.data.get("sentinel_solver_url")
+            or ""
+        ).strip().rstrip("/")
+
+    @property
+    def sentinel_solver_key(self) -> str:
+        return str(
+            os.getenv("CHATGPT2API_SENTINEL_SOLVER_KEY")
+            or self.data.get("sentinel_solver_key")
+            or ""
+        ).strip()
+
+    @property
     def app_version(self) -> str:
         try:
             value = VERSION_FILE.read_text(encoding="utf-8").strip()
@@ -585,7 +602,9 @@ class ConfigStore:
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
+        data["sentinel_solver_url"] = self.sentinel_solver_url
         data.pop("auth-key", None)
+        data.pop("sentinel_solver_key", None)
         return data
 
     def get_proxy_settings(self) -> str:
