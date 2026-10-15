@@ -7,6 +7,7 @@
 - SENTINEL_SOLVER_KEY：可选，设置后请求需带 `Authorization: Bearer <key>`
 - SENTINEL_SOLVER_PROXY：可选，浏览器出网代理（如 http://host:7890），应与主服务出口一致
 - SENTINEL_SOLVER_USER_AGENT：可选，默认按内置 Chromium 版本生成 Linux Chrome UA
+- SENTINEL_SOLVER_TIMEZONE：可选，页面时区（如 Asia/Tokyo），应与出口 IP 所在地一致；默认跟随系统
 - SENTINEL_SOLVER_REFRESH_SECONDS：页面定期重开的间隔，默认 1800
 - SENTINEL_SOLVER_HEADLESS：默认 true；调试时可设为 false
 - PORT：监听端口，默认 8080
@@ -37,6 +38,7 @@ window.chrome = window.chrome || { runtime: {} };
 SOLVER_KEY = os.getenv("SENTINEL_SOLVER_KEY", "").strip()
 PROXY = os.getenv("SENTINEL_SOLVER_PROXY", "").strip()
 USER_AGENT = os.getenv("SENTINEL_SOLVER_USER_AGENT", "").strip()
+TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
 REFRESH_SECONDS = max(60, int(os.getenv("SENTINEL_SOLVER_REFRESH_SECONDS", "1800")))
 HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 READY_TIMEOUT_SECONDS = 60
@@ -106,11 +108,14 @@ class SolverPage:
             except Exception:
                 pass
         self._page = None
-        context = await self._browser.new_context(
-            locale="zh-CN",
-            viewport={"width": 1280, "height": 800},
-            user_agent=self.user_agent,
-        )
+        context_kwargs = {
+            "locale": "zh-CN",
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": self.user_agent,
+        }
+        if TIMEZONE:
+            context_kwargs["timezone_id"] = TIMEZONE
+        context = await self._browser.new_context(**context_kwargs)
         await context.add_init_script(BASE_INIT_SCRIPT)
         await context.add_init_script(VM_SCRIPT)
         await Stealth().apply_stealth_async(context)
@@ -160,6 +165,7 @@ class SolverPage:
             "page_age_seconds": int(time.monotonic() - self._opened_at) if self._opened_at else None,
             "browser_version": self._browser.version if self._browser else None,
             "user_agent": self.user_agent,
+            "timezone": TIMEZONE or None,
             "last_error": self.last_error or None,
         }
 

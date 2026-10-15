@@ -42,6 +42,7 @@ CHATGPT2API_SENTINEL_SOLVER_KEY=<与 SENTINEL_SOLVER_KEY 相同>
 | `SENTINEL_SOLVER_KEY` | 空 | 访问密钥 |
 | `SENTINEL_SOLVER_PROXY` | 空 | 浏览器出网代理，应与主服务访问 chatgpt.com 的出口一致 |
 | `SENTINEL_SOLVER_USER_AGENT` | 按内置 Chromium 版本生成 | 页面 UA |
+| `SENTINEL_SOLVER_TIMEZONE` | 跟随系统 | 页面时区（如 `Asia/Tokyo`），建议与出口 IP 所在地一致 |
 | `SENTINEL_SOLVER_REFRESH_SECONDS` | 1800 | 页面定期重开的间隔 |
 | `SENTINEL_SOLVER_HEADLESS` | true | 调试时可设为 false |
 | `PORT` | 8080 | 监听端口 |
