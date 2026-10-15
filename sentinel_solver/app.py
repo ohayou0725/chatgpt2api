@@ -1,7 +1,10 @@
-"""sentinel 求解服务：常驻一个无头 Chrome 的 chatgpt.com 页面，替主服务计算 Turnstile / SO token。
+"""sentinel 求解服务：常驻一个无头 Chrome 的 chatgpt.com 页面，替主服务完成两件事。
 
-2026-10-14 起 chatgpt.com 的对话接口要求 Turnstile token 必须在真实的 chatgpt.com 页面里算出，
-纯 Python/Node 模拟的结果会被拒（403）。主服务不打包浏览器，改为通过 HTTP 调用本服务。
+1. 计算 Turnstile / SO token（2026-10-14 起对话接口要求 token 出自真实页面）。
+2. 转发主服务发往 chatgpt.com 的 HTTP 请求（`/v1/relay`）——2026-10-15 起
+   Cloudflare 对主服务出口的所有非浏览器客户端在敏感路由（首页、sentinel
+   prepare、conversation init 等）统一下发托管挑战，curl_cffi 任何指纹都无法
+   通过，只有真实 Chromium 可以，因此由本服务的浏览器上下文代发请求。
 
 环境变量：
 - SENTINEL_SOLVER_KEY：可选，设置后请求需带 `Authorization: Bearer <key>`
@@ -15,11 +18,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
@@ -42,6 +47,21 @@ TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
 REFRESH_SECONDS = max(60, int(os.getenv("SENTINEL_SOLVER_REFRESH_SECONDS", "1800")))
 HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 READY_TIMEOUT_SECONDS = 60
+
+# 转发时丢弃的请求头：传输层细节，以及必须由浏览器自己补齐的指纹类头
+DROP_REQUEST_HEADERS = {
+    "host", "content-length", "connection", "keep-alive", "transfer-encoding", "te", "trailer",
+    "upgrade", "accept-encoding", "cookie", "user-agent",
+    "sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list", "sec-ch-ua-mobile", "sec-ch-ua-model",
+    "sec-ch-ua-platform", "sec-ch-ua-platform-version",
+}
+# 转发时丢弃的响应头：由浏览器解码处理过，回传会造成双重解码
+DROP_RESPONSE_HEADERS = {
+    "content-encoding", "content-length", "transfer-encoding", "connection", "set-cookie", "set-cookie2",
+}
+RELAY_TIMEOUT_MIN_MS = 5000
+RELAY_TIMEOUT_MAX_MS = 900000
 
 
 class SolverPage:
@@ -194,6 +214,14 @@ class SORequest(BaseModel):
     p: str
 
 
+class RelayRequest(BaseModel):
+    method: str = "GET"
+    url: str
+    headers: dict[str, str] = {}
+    body_b64: str = ""
+    timeout_ms: int = 300000
+
+
 def require_key(authorization: str | None) -> None:
     if not SOLVER_KEY:
         return
@@ -202,9 +230,69 @@ def require_key(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid solver key")
 
 
+def _is_forbidden_host(host: str) -> bool:
+    """转发只允许公网 https；挡掉本机/内网/元数据地址，避免变成内网探针。"""
+    name = host.lower().strip("[]")
+    if name in {"localhost", "metadata.google.internal"} or name.endswith((".local", ".internal", ".localhost")):
+        return True
+    parts = name.split(".")
+    if len(parts) == 4 and all(part.isdigit() for part in parts):
+        first, second = int(parts[0]), int(parts[1])
+        return (
+            first in {0, 10, 127}
+            or (first == 169 and second == 254)
+            or (first == 172 and 16 <= second <= 31)
+            or (first == 192 and second == 168)
+        )
+    return False
+
+
+async def _relay_fetch(page: Page, method: str, url: str, headers: dict[str, str], payload: bytes | None,
+                       timeout_ms: int):
+    kwargs: dict[str, object] = {"method": method, "timeout": timeout_ms, "fail_on_status_code": False}
+    if headers:
+        kwargs["headers"] = headers
+    if payload is not None:
+        kwargs["data"] = payload
+    return await page.context.request.fetch(url, **kwargs)
+
+
 @app.get("/health")
 async def health() -> dict[str, object]:
     return solver.status()
+
+
+@app.get("/v1/cookies")
+async def get_cookies(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    """返回求解页面当前持有的 chatgpt.com cookie 与浏览器指纹（诊断用）。
+
+    本服务只输出求解页面自己的浏览器状态，不接收也不返回任何账号数据。
+    """
+    require_key(authorization)
+    try:
+        page = await solver.page()
+        cookies = await page.context.cookies("https://chatgpt.com/")
+        client_hints = await page.evaluate(
+            """async () => {
+                const data = navigator.userAgentData;
+                if (!data) return {};
+                const high = await data.getHighEntropyValues(
+                    ["architecture", "bitness", "fullVersionList", "platformVersion"]
+                ).catch(() => ({}));
+                return {
+                    brands: data.brands,
+                    mobile: data.mobile,
+                    platform: data.platform,
+                    architecture: high.architecture || "",
+                    bitness: high.bitness || "",
+                    platformVersion: high.platformVersion || "",
+                    fullVersionList: high.fullVersionList || [],
+                };
+            }"""
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"cookie fetch failed: {exc}") from exc
+    return {"cookies": cookies, "user_agent": solver.user_agent, "client_hints": client_hints}
 
 
 @app.post("/v1/turnstile")
@@ -227,6 +315,40 @@ async def solve_so(body: SORequest, authorization: str | None = Header(default=N
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"so solve failed: {exc}") from exc
     return {"token": str(token or "")}
+
+
+@app.post("/v1/relay")
+async def relay(body: RelayRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    """用浏览器上下文代发一个 HTTP 请求（主服务唯一能通过 Cloudflare 的出口）。
+
+    浏览器自动补齐 UA / Client Hints / cookie；若浏览器自身吃到 CF 挑战
+    （例如页面上的校验过期），重开一次页面后重试一遍。
+    """
+    require_key(authorization)
+    parsed = urlparse(str(body.url or "").strip())
+    if parsed.scheme != "https" or not parsed.hostname or _is_forbidden_host(parsed.hostname):
+        raise HTTPException(status_code=400, detail="url not allowed")
+    method = (body.method or "GET").upper()
+    headers = {k: v for k, v in (body.headers or {}).items() if k.lower() not in DROP_REQUEST_HEADERS}
+    payload = base64.b64decode(body.body_b64) if body.body_b64 else None
+    timeout_ms = max(RELAY_TIMEOUT_MIN_MS, min(int(body.timeout_ms or 300000), RELAY_TIMEOUT_MAX_MS))
+    try:
+        page = await solver.page()
+        response = await _relay_fetch(page, method, body.url, headers, payload, timeout_ms)
+        if response.status == 403 and str((response.headers or {}).get("cf-mitigated") or "") == "challenge":
+            await solver.invalidate()
+            page = await solver.page()
+            response = await _relay_fetch(page, method, body.url, headers, payload, timeout_ms)
+        raw = await response.body()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"relay failed: {exc}") from exc
+    response_headers = {k: v for k, v in (response.headers or {}).items() if k.lower() not in DROP_RESPONSE_HEADERS}
+    return {
+        "status": response.status,
+        "headers": response_headers,
+        "url": response.url,
+        "body_b64": base64.b64encode(raw).decode("ascii"),
+    }
 
 
 if __name__ == "__main__":

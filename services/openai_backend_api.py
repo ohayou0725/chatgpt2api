@@ -24,6 +24,7 @@ from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
 from services.sentinel_solver_client import solve_turnstile, solver_user_agent
+from services.solver_relay_session import RelaySession
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -184,11 +185,16 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            account=self.account,
-            impersonate=self.fp["impersonate"],
-            verify=True,
-        ))
+        if config.sentinel_solver_url:
+            # 2026-10-15 起本机出口的 curl_cffi 会被 Cloudflare 挑战，改由求解服务的
+            # 浏览器上下文代发（见 services/solver_relay_session.py 模块说明）。
+            self.session = RelaySession(config.sentinel_solver_url, config.sentinel_solver_key)
+        else:
+            self.session = requests.Session(**proxy_settings.build_session_kwargs(
+                account=self.account,
+                impersonate=self.fp["impersonate"],
+                verify=True,
+            ))
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,

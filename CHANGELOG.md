@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.8.2 - 2026-10-15
+
++ [修复] Cloudflare 对主服务出口的非浏览器客户端（curl_cffi 各版本指纹）在敏感路由（首页、sentinel prepare、conversation init、f/conversation 等）统一下发托管挑战（403 + `cf-mitigated: challenge`）后，chatgpt.com 请求改由 sentinel 求解服务的浏览器上下文代发（新增 `/v1/relay`），浏览器自动补齐 UA / Client Hints / cookie；浏览器自身吃到挑战时自动重开页面重试。
++ [优化] 首页预热改走转发后，PoW 的脚本清单与 data-build 与真实页面一致；请求 UA 与 sentinel token 编码的求解页面 UA 完全一致。
+
+## 1.8.1 - 2026-10-15
+
++ [修复] 恢复对话与生图：sentinel 握手新增独立求解服务（`sentinel_solver/`，常驻真实 Chromium 页面计算 Turnstile / SO token，密钥鉴权、不暴露端口），缺失时上游返回 403、低质量时返回伪装成 404 的 "Model not found"。
++ [修复] 上游把低质量 sentinel 请求伪装成 404 "Model not found" 时精确识别并换号重试，失败账号进入 10 分钟本地冷却；不清空真实额度、不标记封号、不扣代理健康分，其他 404 不套用该规则。
++ [优化] curl_cffi TLS 指纹默认升级为 chrome146（chrome110 被判为低可信）。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。
